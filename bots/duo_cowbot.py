@@ -49,6 +49,40 @@ class BotPlayer:
     - State 41: Add sauce to plate
     """
     
+    _STATE_NAMES = {
+        0: "INIT",
+        1: "BUY_PAN",
+        2: "BUY_MEAT",
+        3: "PLACE_MEAT_ON_COUNTER",
+        4: "CHOP_MEAT",
+        5: "PICKUP_CHOPPED_MEAT",
+        6: "PLACE_MEAT_IN_PAN",
+        7: "COOKING_STARTS",
+        8: "BUY_PLATE",
+        9: "PLACE_PLATE",
+        10: "BUY_NOODLES",
+        11: "ADD_NOODLES",
+        12: "WAIT_MEAT_COOK",
+        13: "ADD_MEAT",
+        14: "PICKUP_PLATE",
+        15: "SUBMIT_ORDER",
+        16: "TRASH_RECOVERY",
+        20: "BUY_EGG",
+        21: "PLACE_EGG_IN_PAN",
+        22: "WAIT_EGG_COOK",
+        23: "ADD_EGG",
+        30: "BUY_ONIONS",
+        31: "PLACE_ONIONS_ON_COUNTER",
+        32: "CHOP_ONIONS",
+        33: "PICKUP_CHOPPED_ONIONS",
+        34: "ADD_ONIONS",
+        35: "STORE_ONIONS_IN_BOX",
+        40: "BUY_SAUCE",
+        41: "ADD_SAUCE",
+        50: "PICKUP_FROM_BOX",
+        51: "ADD_FROM_BOX",
+    }
+
     def __init__(self, map_copy):
         self.map = map_copy
         self.assembly_counter = None  # Counter for plate
@@ -56,6 +90,7 @@ class BotPlayer:
         self.cooker_loc = None
         self.my_bot_id = None
         self.state = 0
+        self._transition_log = deque(maxlen=50)
         
         # Order tracking
         self.current_order = None  # Current order being processed
