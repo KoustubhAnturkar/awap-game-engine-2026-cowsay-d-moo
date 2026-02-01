@@ -111,14 +111,17 @@ class BotPlayer:
         self.dual_bot_mode = (self._num_counters >= 2 and self._num_cookers >= 2)
         self._cache_initialized = True
 
-    def get_bfs_path(self, controller: RobotController, start: Tuple[int, int], target_predicate) -> Optional[Tuple[int, int]]:
+    def get_bfs_path(self, controller: RobotController, start: Tuple[int, int], target_predicate, blocked_positions: set = None) -> Optional[Tuple[int, int]]:
         """
         Use Dijkstra's algorithm to find the shortest path.
         Returns the first step (dx, dy) to take, or None if no path exists.
         Diagonal moves cost sqrt(2), orthogonal moves cost 1.
         Optimized: uses parent pointers instead of storing full paths.
+        blocked_positions: set of (x, y) tuples that should be treated as impassable (other bots)
         """
         SQRT2 = 1.41421356
+        if blocked_positions is None:
+            blocked_positions = set()
         
         # Priority queue: (cost, counter, x, y) - counter breaks ties for stable ordering
         counter = 0
@@ -154,7 +157,8 @@ class BotPlayer:
                     if dx == 0 and dy == 0:
                         continue
                     nx, ny = curr_x + dx, curr_y + dy
-                    if 0 <= nx < w and 0 <= ny < h and game_map.is_tile_walkable(nx, ny):
+                    # Check walkable AND not blocked by another bot
+                    if 0 <= nx < w and 0 <= ny < h and game_map.is_tile_walkable(nx, ny) and (nx, ny) not in blocked_positions:
                         # Calculate move cost: diagonal = sqrt(2), orthogonal = 1
                         move_cost = SQRT2 if (dx != 0 and dy != 0) else 1.0
                         new_cost = cost + move_cost
@@ -191,9 +195,21 @@ class BotPlayer:
                             queue.append(((nx, ny), dist + 1))
         return None
 
+    def _get_other_bot_positions(self, controller: RobotController, exclude_bot_id: int) -> set:
+        """Get positions of all other bots on our team."""
+        team = controller.get_team()
+        my_bots = controller.get_team_bot_ids(team)
+        positions = set()
+        for bot_id in my_bots:
+            if bot_id != exclude_bot_id:
+                bot_state = controller.get_bot_state(bot_id)
+                if bot_state:
+                    positions.add((bot_state['x'], bot_state['y']))
+        return positions
+
     def move_towards(self, controller: RobotController, bot_id: int, target_x: int, target_y: int) -> bool:
         """
-        Move the bot towards the target position.
+        Move the bot towards the target position, avoiding other bots.
         Returns True if already adjacent to target, False otherwise.
         """
         bot_state = controller.get_bot_state(bot_id)
@@ -207,11 +223,30 @@ class BotPlayer:
         
         if is_adjacent_to_target(bx, by, None):
             return True
-            
-        step = self.get_bfs_path(controller, (bx, by), is_adjacent_to_target)
+        
+        # Get positions of other bots to avoid
+        other_bot_positions = self._get_other_bot_positions(controller, bot_id)
+        
+        step = self.get_bfs_path(controller, (bx, by), is_adjacent_to_target, other_bot_positions)
         if step and (step[0] != 0 or step[1] != 0):
-            controller.move(bot_id, step[0], step[1])
-            return False 
+            # Double check we're not moving into another bot
+            new_x, new_y = bx + step[0], by + step[1]
+            if (new_x, new_y) not in other_bot_positions:
+                controller.move(bot_id, step[0], step[1])
+                return False
+            else:
+                # Try to find an alternative move or wait
+                game_map = controller.get_map(controller.get_team())
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        if dx == 0 and dy == 0:
+                            continue
+                        nx, ny = bx + dx, by + dy
+                        if game_map.is_tile_walkable(nx, ny) and (nx, ny) not in other_bot_positions:
+                            controller.move(bot_id, dx, dy)
+                            return False
+                # No valid move, just wait
+                return False
         return False 
 
     def find_nearest_tile(self, controller: RobotController, bot_x: int, bot_y: int, tile_name: str) -> Optional[Tuple[int, int]]:
@@ -304,20 +339,17 @@ class BotPlayer:
         # Determine how many bots can work simultaneously
         num_active_bots = 2 if (self.dual_bot_mode and len(my_bots) >= 2) else 1
         
+
         # Allocate resources to bots if not done yet
         if num_active_bots >= 2 and not self.bot_resources:
             self._allocate_resources(controller, my_bots[:2])
         
-        # Alternate which bot acts each turn for fairness
+        # Only ONE bot acts per turn to avoid competing for money
         if num_active_bots >= 2:
-            # Run bots in alternating order: turn 0 -> bot 0 first, turn 1 -> bot 1 first
-            bot_order = list(range(num_active_bots))
-            if self.turn_counter % 2 == 1:
-                bot_order = bot_order[::-1]  # Reverse order on odd turns
-            
-            for i in bot_order:
-                if i < len(my_bots):
-                    self._run_bot(controller, my_bots[i], i)
+            # Alternate: turn 0 -> bot 0, turn 1 -> bot 1, turn 2 -> bot 0, etc.
+            active_bot_index = self.turn_counter % 2
+            if active_bot_index < len(my_bots):
+                self._run_bot(controller, my_bots[active_bot_index], active_bot_index)
         else:
             # Single bot mode - just run the one bot
             self._run_bot(controller, my_bots[0], 0)
@@ -329,25 +361,39 @@ class BotPlayer:
             self._handle_idle_bot(controller, my_bots[i])
 
     def _allocate_resources(self, controller: RobotController, bot_ids: List[int]):
-        """Allocate counters and cookers to each bot."""
+        """Allocate counters and cookers to each bot based on proximity to shop."""
         counters = self._tile_cache.get("COUNTER", [])
         cookers = self._tile_cache.get("COOKER", [])
+        shops = self._tile_cache.get("SHOP", [])
         
         if len(counters) < 2 or len(cookers) < 2:
             return
         
-        # Sort by position to get spatially separated resources
-        counters_sorted = sorted(counters, key=lambda p: (p[0], p[1]))
-        cookers_sorted = sorted(cookers, key=lambda p: (p[0], p[1]))
+        # Find the shop location (use first one if multiple)
+        if not shops:
+            # Fallback to spatial sorting if no shop found
+            counters_sorted = sorted(counters, key=lambda p: (p[0], p[1]))
+            cookers_sorted = sorted(cookers, key=lambda p: (p[0], p[1]))
+        else:
+            shop_x, shop_y = shops[0]
+            
+            # Sort counters and cookers by distance to shop (closest first)
+            counters_sorted = sorted(counters, key=lambda p: max(abs(p[0] - shop_x), abs(p[1] - shop_y)))
+            cookers_sorted = sorted(cookers, key=lambda p: max(abs(p[0] - shop_x), abs(p[1] - shop_y)))
         
-        # Assign first bot to first half, second bot to second half
+        # Assign first bot to closest resources, second bot to next closest
         self.bot_resources[bot_ids[0]] = {
             'counter': counters_sorted[0],
             'cooker': cookers_sorted[0]
         }
+        # For second bot, pick resources that don't conflict with first bot
+        # Use second closest counter and cooker
+        second_counter = counters_sorted[1] if len(counters_sorted) > 1 else counters_sorted[0]
+        second_cooker = cookers_sorted[1] if len(cookers_sorted) > 1 else cookers_sorted[0]
+        
         self.bot_resources[bot_ids[1]] = {
-            'counter': counters_sorted[-1],
-            'cooker': cookers_sorted[-1]
+            'counter': second_counter,
+            'cooker': second_cooker
         }
 
     def _run_bot(self, controller: RobotController, bot_id: int, bot_index: int):
@@ -378,8 +424,11 @@ class BotPlayer:
         cx, cy = bs['assembly_counter']
         kx, ky = bs['cooker_loc']
         
+        # print(f"Bot {bot_id} running state {bs['state']} at ({bx},{by}), counter=({cx},{cy}), cooker=({kx},{ky})")
+        
         # Error recovery: if we're holding something in certain states, trash it
         if bs['state'] in [2, 8, 10] and bot_info.get('holding'):
+            # print(f"Bot {bot_id} error recovery: holding item in state {bs['state']}, going to trash")
             bs['state'] = 16
         
         # State machine for cooking workflow
@@ -429,22 +478,125 @@ class BotPlayer:
         
         # State 0: Initialize - fetch orders and pick one to work on
         if bs['state'] == 0:
-            # Get active orders
+            # Get ALL orders and current turn for feasibility analysis
             orders = controller.get_orders(team)
-            active_orders = [o for o in orders if o.get('is_active') and o.get('completed_turn') is None]
+            current_turn = controller.get_turn()
+            current_money = controller.get_team_money(team)
             
-            # Filter out orders already being worked on by other bots
+            # Cost lookup for ingredients
+            ingredient_costs = {
+                'MEAT': 80,
+                'NOODLES': 40,
+                'ONIONS': 30,
+                'EGG': 20,
+                'SAUCE': 10,
+            }
+            
+            def estimate_order_cost(ingredients, needs_pan=False):
+                """Estimate total cost to complete an order."""
+                cost = 2  # Plate cost
+                if needs_pan:
+                    cost += 4  # Pan cost
+                for ing in ingredients:
+                    cost += ingredient_costs.get(ing, 0)
+                return cost
+            
+            def estimate_completion_time(ingredients):
+                """Estimate turns needed to complete an order based on ingredients."""
+                estimated_time = 0
+                for ing in ingredients:
+                    if ing == 'MEAT':
+                        estimated_time += 40  # chop + cook + wait
+                    elif ing == 'EGG':
+                        estimated_time += 25  # cook + wait
+                    elif ing == 'ONIONS':
+                        estimated_time += 20  # chop
+                    elif ing == 'NOODLES':
+                        estimated_time += 10  # just buy and add
+                    elif ing == 'SAUCE':
+                        estimated_time += 8   # just buy and add
+                # Add base time for plate + submit + movement
+                estimated_time += 20
+                return estimated_time
+            
+            def is_feasible(order):
+                """Check if an order can realistically be completed in time."""
+                expires = order.get('expires_turn', 9999)
+                ingredients = order.get('required', [])
+                time_left = expires - current_turn
+                estimated_time = estimate_completion_time(ingredients)
+                # Need at least some margin - if we can't make it, filter it out
+                return time_left >= estimated_time * 0.8  # Allow 20% buffer for movement
+            
+            def can_afford(order):
+                """Check if we have enough money to complete this order."""
+                ingredients = order.get('required', [])
+                needs_pan = any(ing in ['MEAT', 'EGG'] for ing in ingredients)
+                # Check if cooker already has a pan
+                tile = controller.get_tile(team, kx, ky)
+                has_pan = tile and isinstance(getattr(tile, 'item', None), Pan)
+                cost = estimate_order_cost(ingredients, needs_pan and not has_pan)
+                return current_money >= cost
+            
+            def score_order(order):
+                """
+                Score an order based on reward, complexity, and time efficiency.
+                Higher score = better order to pick.
+                """
+                reward = order.get('reward', 0)
+                expires = order.get('expires_turn', 9999)
+                ingredients = order.get('required', [])
+                
+                time_left = expires - current_turn
+                estimated_time = estimate_completion_time(ingredients)
+                time_margin = time_left - estimated_time
+                
+                # Urgency bonus: orders expiring soon get slight priority if feasible
+                urgency_bonus = max(0, 50 - time_margin) * 0.05 if time_margin > 0 else 0
+                
+                # Efficiency: reward per estimated time unit
+                efficiency = reward / max(estimated_time, 1)
+                
+                # Complexity penalty: more ingredients = harder to complete
+                complexity_factor = 1.0 / (1 + len(ingredients) * 0.15)
+                
+                # Time margin bonus: comfortable margin = more reliable
+                margin_factor = min(1.5, 1.0 + time_margin / 100)
+                
+                # Final score: efficiency * complexity * margin + urgency + raw reward bonus
+                score = (efficiency * 15) * complexity_factor * margin_factor + urgency_bonus + reward * 0.05
+                
+                return score
+            
+            # Step 1: Filter to only active, uncompleted orders
+            candidate_orders = [o for o in orders if o.get('is_active') and o.get('completed_turn') is None]
+            
+            # Step 2: Filter out orders already being worked on by other bots
             for other_bot_id, other_bs in self.bot_states.items():
                 if other_bot_id != bot_id and other_bs.get('current_order'):
-                    other_order_id = other_bs['current_order'].get('id')
-                    active_orders = [o for o in active_orders if o.get('id') != other_order_id]
+                    other_order_id = other_bs['current_order'].get('order_id')
+                    candidate_orders = [o for o in candidate_orders if o.get('order_id') != other_order_id]
             
-            if not active_orders:
-                return  # No orders to process
+            # Step 3: Filter out orders that CANNOT be completed in time
+            feasible_orders = [o for o in candidate_orders if is_feasible(o)]
             
-            # Pick the order expiring soonest
-            active_orders.sort(key=lambda o: o.get('expires_turn', 9999))
-            bs['current_order'] = active_orders[0]
+            # Step 4: Filter out orders we can't afford right now
+            affordable_orders = [o for o in feasible_orders if can_afford(o)]
+            
+            # If no affordable orders, wait for money to accumulate
+            if not affordable_orders:
+                # Check if there are feasible orders we just can't afford yet
+                if feasible_orders:
+                    return  # Wait for money
+                # Fall back to any candidate if nothing is feasible
+                affordable_orders = [o for o in candidate_orders if can_afford(o)]
+            
+            if not affordable_orders:
+                return  # No orders we can afford right now, wait for money
+            
+            # Step 5: Score and sort affordable orders by best value
+            affordable_orders.sort(key=score_order, reverse=True)
+            bs['current_order'] = affordable_orders[0]
             ingredients = bs['current_order'].get('required', [])
             
             # Check if we have only one counter - if so, reorder to do choppable items first
@@ -475,21 +627,33 @@ class BotPlayer:
             # Do all chopping first, put in pan to cook, THEN buy plate
             has_choppable = any(ing in ['MEAT', 'ONIONS'] for ing in bs['current_order_ingredients'])
             
+            # print(f"Bot {bot_id} state 0: Order {bs['current_order'].get('order_id')} with ingredients {bs['current_order_ingredients']}")
+            # print(f"Bot {bot_id} state 0: needs_pan={needs_pan}, has_choppable={has_choppable}, single_counter={bs['single_counter_mode']}")
+            
             if needs_pan:
                 tile = controller.get_tile(team, kx, ky)
-                if tile and isinstance(getattr(tile, 'item', None), Pan):
+                has_pan = tile and isinstance(getattr(tile, 'item', None), Pan)
+                # print(f"Bot {bot_id} state 0: Cooker at ({kx},{ky}) has_pan={has_pan}")
+                if has_pan:
                     if bs['single_counter_mode'] and has_choppable:
                         # Single counter: start with first choppable ingredient before plate
-                        bs['state'] = self._get_state_for_ingredient(bs)
+                        next_state = self._get_state_for_ingredient(bs)
+                        # print(f"Bot {bot_id} state 0 -> {next_state} (single counter, chop first)")
+                        bs['state'] = next_state
                     else:
+                        # print(f"Bot {bot_id} state 0 -> 8 (go buy plate)")
                         bs['state'] = 8  # Go buy plate
                 else:
+                    # print(f"Bot {bot_id} state 0 -> 1 (go buy pan)")
                     bs['state'] = 1  # Go buy pan first
             else:
                 if bs['single_counter_mode'] and has_choppable:
                     # Single counter with choppable but no cookable - chop first
-                    bs['state'] = self._get_state_for_ingredient(bs)
+                    next_state = self._get_state_for_ingredient(bs)
+                    # print(f"Bot {bot_id} state 0 -> {next_state} (no pan needed, chop first)")
+                    bs['state'] = next_state
                 else:
+                    # print(f"Bot {bot_id} state 0 -> 8 (no pan needed, buy plate)")
                     bs['state'] = 8  # Go buy plate (no pan needed)
 
         # State 1: Buy pan and place on cooker
@@ -514,12 +678,20 @@ class BotPlayer:
         elif bs['state'] == 2:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
+                # print(f"Bot {bot_id} state 2: No shop found!")
                 return
             sx, sy = shop_pos
-            if self.move_towards(controller, bot_id, sx, sy):
+            adjacent = self.move_towards(controller, bot_id, sx, sy)
+            # print(f"Bot {bot_id} state 2: Shop at ({sx},{sy}), adjacent={adjacent}, money={controller.get_team_money(team)}, cost={FoodType.MEAT.buy_cost}")
+            if adjacent:
                 if controller.get_team_money(team) >= FoodType.MEAT.buy_cost:
-                    if controller.buy(bot_id, FoodType.MEAT, sx, sy):
+                    result = controller.buy(bot_id, FoodType.MEAT, sx, sy)
+                    # print(f"Bot {bot_id} state 2: Buy result={result}")
+                    if result:
                         bs['state'] = 3
+                else:
+                    # print(f"Bot {bot_id} state 2: Not enough money!")
+                    pass
 
         # State 3: Place meat on counter for chopping
         elif bs['state'] == 3:
@@ -692,12 +864,20 @@ class BotPlayer:
         elif bs['state'] == 20:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
+                # print(f"Bot {bot_id} state 20: No shop found!")
                 return
             sx, sy = shop_pos
-            if self.move_towards(controller, bot_id, sx, sy):
+            adjacent = self.move_towards(controller, bot_id, sx, sy)
+            # print(f"Bot {bot_id} state 20: Shop at ({sx},{sy}), adjacent={adjacent}, money={controller.get_team_money(team)}, cost={FoodType.EGG.buy_cost}")
+            if adjacent:
                 if controller.get_team_money(team) >= FoodType.EGG.buy_cost:
-                    if controller.buy(bot_id, FoodType.EGG, sx, sy):
+                    result = controller.buy(bot_id, FoodType.EGG, sx, sy)
+                    # print(f"Bot {bot_id} state 20: Buy result={result}")
+                    if result:
                         bs['state'] = 21
+                else:
+                    # print(f"Bot {bot_id} state 20: Not enough money!")
+                    pass
 
         # State 21: Place egg in pan on cooker (starts cooking)
         elif bs['state'] == 21:

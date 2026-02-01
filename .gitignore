@@ -2,3 +2,5 @@ __pycache__
 .vscode
 .venv
 replays/*
+maps/map_*.txt
+.DS_Store
