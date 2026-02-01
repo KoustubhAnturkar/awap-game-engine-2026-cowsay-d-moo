@@ -51,27 +51,41 @@ class BotPlayer:
     
     def __init__(self, map_copy):
         self.map = map_copy
-        self.assembly_counter = None  # Counter for plate
-        self.chopping_counter = None  # Counter for chopping (separate from plate)
-        self.cooker_loc = None
-        self.my_bot_id = None
-        self.state = 0
-        
-        # Order tracking
-        self.current_order = None  # Current order being processed
-        self.current_order_ingredients = []  # List of ingredients for current order
-        self.current_ingredient_index = 0  # Which ingredient we're working on
-        self.plate_ready = False  # Whether plate is placed and ready for ingredients
-        self.plate_temp_held = False  # True when we temporarily picked up plate for chopping
-        self.held_food_for_chop = None  # Temporarily store what we're chopping when picking up plate
-        self.single_counter_mode = False  # True when only one counter available
-        self.chopped_items_ready = []  # Items that have been chopped and are waiting in box
-        self.meat_in_pan = False  # True when meat has been placed in pan (for single counter mode)
         
         # Pre-cache tile locations for O(1) lookup instead of O(n²) grid scans
         self._tile_cache = {}  # tile_name -> list of (x, y) positions
         self._num_counters = 0
+        self._num_cookers = 0
         self._cache_initialized = False
+        
+        # Dual bot mode - track if we have enough resources for 2 bots
+        self.dual_bot_mode = False
+        self.bot_states = {}  # bot_id -> BotState dict
+        
+        # Resource allocation for dual bot mode
+        self.bot_resources = {}  # bot_id -> {'counter': (x,y), 'cooker': (x,y)}
+        
+        # Turn counter for alternating bot execution
+        self.turn_counter = 0
+        
+    def _create_bot_state(self) -> Dict[str, Any]:
+        """Create a fresh state dict for a bot."""
+        return {
+            'assembly_counter': None,
+            'chopping_counter': None,
+            'cooker_loc': None,
+            'state': 0,
+            'current_order': None,
+            'current_order_ingredients': [],
+            'current_ingredient_index': 0,
+            'plate_ready': False,
+            'plate_temp_held': False,
+            'held_food_for_chop': None,
+            'single_counter_mode': False,
+            'chopped_items_ready': [],
+            'meat_in_pan': False,
+            'meat_placed_turn': None,
+        }
         
     def _init_tile_cache(self):
         """Initialize tile location cache for O(1) lookups."""
@@ -79,6 +93,7 @@ class BotPlayer:
             return
         self._tile_cache = {}
         self._num_counters = 0
+        self._num_cookers = 0
         for x in range(self.map.width):
             for y in range(self.map.height):
                 tile = self.map.tiles[x][y]
@@ -88,6 +103,12 @@ class BotPlayer:
                 self._tile_cache[tile_name].append((x, y))
                 if tile_name == "COUNTER":
                     self._num_counters += 1
+                if tile_name == "COOKER":
+                    self._num_cookers += 1
+        
+        # Check if we have enough resources for dual bot mode
+        # Need at least 2 counters and 2 cookers for 2 bots to work simultaneously
+        self.dual_bot_mode = (self._num_counters >= 2 and self._num_cookers >= 2)
         self._cache_initialized = True
 
     def get_bfs_path(self, controller: RobotController, start: Tuple[int, int], target_predicate) -> Optional[Tuple[int, int]]:
@@ -267,68 +288,167 @@ class BotPlayer:
     def play_turn(self, controller: RobotController):
         """
         Main game loop - called every turn.
+        Supports dual bot mode when enough resources are available.
         """
+        self._init_tile_cache()
+        
         my_bots = controller.get_team_bot_ids(controller.get_team())
         if not my_bots:
             return
-    
-        # Primary bot handles cooking
-        self.my_bot_id = my_bots[0]
-        bot_id = self.my_bot_id
         
+        # Initialize bot states if needed
+        for bot_id in my_bots:
+            if bot_id not in self.bot_states:
+                self.bot_states[bot_id] = self._create_bot_state()
+        
+        # Determine how many bots can work simultaneously
+        num_active_bots = 2 if (self.dual_bot_mode and len(my_bots) >= 2) else 1
+        
+        # Allocate resources to bots if not done yet
+        if num_active_bots >= 2 and not self.bot_resources:
+            self._allocate_resources(controller, my_bots[:2])
+        
+        # Alternate which bot acts each turn for fairness
+        if num_active_bots >= 2:
+            # Run bots in alternating order: turn 0 -> bot 0 first, turn 1 -> bot 1 first
+            bot_order = list(range(num_active_bots))
+            if self.turn_counter % 2 == 1:
+                bot_order = bot_order[::-1]  # Reverse order on odd turns
+            
+            for i in bot_order:
+                if i < len(my_bots):
+                    self._run_bot(controller, my_bots[i], i)
+        else:
+            # Single bot mode - just run the one bot
+            self._run_bot(controller, my_bots[0], 0)
+        
+        self.turn_counter += 1
+        
+        # Secondary bots beyond the active ones just stay out of the way
+        for i in range(num_active_bots, len(my_bots)):
+            self._handle_idle_bot(controller, my_bots[i])
+
+    def _allocate_resources(self, controller: RobotController, bot_ids: List[int]):
+        """Allocate counters and cookers to each bot."""
+        counters = self._tile_cache.get("COUNTER", [])
+        cookers = self._tile_cache.get("COOKER", [])
+        
+        if len(counters) < 2 or len(cookers) < 2:
+            return
+        
+        # Sort by position to get spatially separated resources
+        counters_sorted = sorted(counters, key=lambda p: (p[0], p[1]))
+        cookers_sorted = sorted(cookers, key=lambda p: (p[0], p[1]))
+        
+        # Assign first bot to first half, second bot to second half
+        self.bot_resources[bot_ids[0]] = {
+            'counter': counters_sorted[0],
+            'cooker': cookers_sorted[0]
+        }
+        self.bot_resources[bot_ids[1]] = {
+            'counter': counters_sorted[-1],
+            'cooker': cookers_sorted[-1]
+        }
+
+    def _run_bot(self, controller: RobotController, bot_id: int, bot_index: int):
+        """Run the state machine for a single bot."""
         bot_info = controller.get_bot_state(bot_id)
         if bot_info is None:
             return
-            
+        
         bx, by = bot_info['x'], bot_info['y']
-
-        # Initialize locations on first run
-        if self.assembly_counter is None:
-            self.assembly_counter = self.find_nearest_tile(controller, bx, by, "COUNTER")
-        if self.cooker_loc is None:
-            self.cooker_loc = self.find_nearest_tile(controller, bx, by, "COOKER")
-
-        if not self.assembly_counter or not self.cooker_loc:
+        bs = self.bot_states[bot_id]
+        
+        # Initialize locations for this bot
+        if bs['assembly_counter'] is None:
+            if bot_id in self.bot_resources:
+                bs['assembly_counter'] = self.bot_resources[bot_id]['counter']
+            else:
+                bs['assembly_counter'] = self.find_nearest_tile(controller, bx, by, "COUNTER")
+        
+        if bs['cooker_loc'] is None:
+            if bot_id in self.bot_resources:
+                bs['cooker_loc'] = self.bot_resources[bot_id]['cooker']
+            else:
+                bs['cooker_loc'] = self.find_nearest_tile(controller, bx, by, "COOKER")
+        
+        if not bs['assembly_counter'] or not bs['cooker_loc']:
             return
-
-        cx, cy = self.assembly_counter
-        kx, ky = self.cooker_loc
-
+        
+        cx, cy = bs['assembly_counter']
+        kx, ky = bs['cooker_loc']
+        
         # Error recovery: if we're holding something in certain states, trash it
-        if self.state in [2, 8, 10] and bot_info.get('holding'):
-            self.state = 16
-
+        if bs['state'] in [2, 8, 10] and bot_info.get('holding'):
+            bs['state'] = 16
+        
         # State machine for cooking workflow
-        self._execute_state(controller, bot_id, bot_info, bx, by, cx, cy, kx, ky)
+        self._execute_state(controller, bot_id, bot_info, bx, by, cx, cy, kx, ky, bs, bot_index)
 
-        # Additional bots move randomly or assist
-        for i in range(1, len(my_bots)):
-            self._handle_secondary_bot(controller, my_bots[i])
+    def _handle_idle_bot(self, controller: RobotController, bot_id: int):
+        """Handle bots that aren't actively working - just stay out of the way."""
+        bot_info = controller.get_bot_state(bot_id)
+        if bot_info is None:
+            return
+        
+        bx, by = bot_info['x'], bot_info['y']
+        holding = bot_info.get('holding')
+        
+        # If holding something, trash it
+        if holding:
+            trash_pos = self.find_nearest_tile(controller, bx, by, "TRASH")
+            if trash_pos:
+                tx, ty = trash_pos
+                if self.move_towards(controller, bot_id, tx, ty):
+                    controller.trash(bot_id, tx, ty)
+            return
+        
+        # Move randomly to stay out of the way
+        possible_moves = []
+        game_map = controller.get_map(controller.get_team())
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = bx + dx, by + dy
+                if game_map.is_tile_walkable(nx, ny):
+                    possible_moves.append((dx, dy))
+        
+        if possible_moves:
+            dx, dy = random.choice(possible_moves)
+            controller.move(bot_id, dx, dy)
 
     def _execute_state(self, controller: RobotController, bot_id: int, bot_info: Dict[str, Any],
-                       bx: int, by: int, cx: int, cy: int, kx: int, ky: int):
+                       bx: int, by: int, cx: int, cy: int, kx: int, ky: int,
+                       bs: Dict[str, Any], bot_index: int):
         """
         Execute the current state in the cooking state machine.
+        bs = bot state dict for this specific bot
         """
         team = controller.get_team()
         
         # State 0: Initialize - fetch orders and pick one to work on
-        if self.state == 0:
+        if bs['state'] == 0:
             # Get active orders
             orders = controller.get_orders(team)
             active_orders = [o for o in orders if o.get('is_active') and o.get('completed_turn') is None]
+            
+            # Filter out orders already being worked on by other bots
+            for other_bot_id, other_bs in self.bot_states.items():
+                if other_bot_id != bot_id and other_bs.get('current_order'):
+                    other_order_id = other_bs['current_order'].get('id')
+                    active_orders = [o for o in active_orders if o.get('id') != other_order_id]
             
             if not active_orders:
                 return  # No orders to process
             
             # Pick the order expiring soonest
             active_orders.sort(key=lambda o: o.get('expires_turn', 9999))
-            self.current_order = active_orders[0]
-            ingredients = self.current_order.get('required', [])
+            bs['current_order'] = active_orders[0]
+            ingredients = bs['current_order'].get('required', [])
             
             # Check if we have only one counter - if so, reorder to do choppable items first
             # This way we chop before placing the plate
-            self._init_tile_cache()  # Ensure cache is initialized
             num_counters = self._num_counters
             
             if num_counters <= 1:
@@ -336,49 +456,50 @@ class BotPlayer:
                 choppable = [i for i in ingredients if i in ['MEAT', 'ONIONS']]
                 cookable_only = [i for i in ingredients if i in ['EGG']]
                 direct = [i for i in ingredients if i in ['NOODLES', 'SAUCE']]
-                self.current_order_ingredients = choppable + cookable_only + direct
+                bs['current_order_ingredients'] = choppable + cookable_only + direct
             else:
-                self.current_order_ingredients = ingredients
+                bs['current_order_ingredients'] = ingredients
             
-            self.current_ingredient_index = 0
-            self.plate_ready = False
-            self.plate_temp_held = False
-            self.single_counter_mode = (num_counters <= 1)
-            self.chopped_items_ready = []
-            self.meat_in_pan = False
+            bs['current_ingredient_index'] = 0
+            bs['plate_ready'] = False
+            bs['plate_temp_held'] = False
+            bs['single_counter_mode'] = (num_counters <= 1)
+            bs['chopped_items_ready'] = []
+            bs['meat_in_pan'] = False
+            bs['meat_placed_turn'] = None
             
             # Check if we need a pan (any cookable ingredients)
-            needs_pan = any(ing in ['MEAT', 'EGG'] for ing in self.current_order_ingredients)
+            needs_pan = any(ing in ['MEAT', 'EGG'] for ing in bs['current_order_ingredients'])
             
             # For single counter mode with choppable items:
             # Do all chopping first, put in pan to cook, THEN buy plate
-            has_choppable = any(ing in ['MEAT', 'ONIONS'] for ing in self.current_order_ingredients)
+            has_choppable = any(ing in ['MEAT', 'ONIONS'] for ing in bs['current_order_ingredients'])
             
             if needs_pan:
                 tile = controller.get_tile(team, kx, ky)
                 if tile and isinstance(getattr(tile, 'item', None), Pan):
-                    if self.single_counter_mode and has_choppable:
+                    if bs['single_counter_mode'] and has_choppable:
                         # Single counter: start with first choppable ingredient before plate
-                        self.state = self._get_state_for_ingredient()
+                        bs['state'] = self._get_state_for_ingredient(bs)
                     else:
-                        self.state = 8  # Go buy plate
+                        bs['state'] = 8  # Go buy plate
                 else:
-                    self.state = 1  # Go buy pan first
+                    bs['state'] = 1  # Go buy pan first
             else:
-                if self.single_counter_mode and has_choppable:
+                if bs['single_counter_mode'] and has_choppable:
                     # Single counter with choppable but no cookable - chop first
-                    self.state = self._get_state_for_ingredient()
+                    bs['state'] = self._get_state_for_ingredient(bs)
                 else:
-                    self.state = 8  # Go buy plate (no pan needed)
+                    bs['state'] = 8  # Go buy plate (no pan needed)
 
         # State 1: Buy pan and place on cooker
-        elif self.state == 1:
+        elif bs['state'] == 1:
             holding = bot_info.get('holding')
             if holding:
                 # We have a pan, place it on cooker
                 if self.move_towards(controller, bot_id, kx, ky):
                     if controller.place(bot_id, kx, ky):
-                        self.state = 2
+                        bs['state'] = 2
             else:
                 # Buy a pan
                 shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
@@ -390,7 +511,7 @@ class BotPlayer:
                         controller.buy(bot_id, ShopCosts.PAN, sx, sy)
 
         # State 2: Buy meat
-        elif self.state == 2:
+        elif bs['state'] == 2:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
                 return
@@ -398,67 +519,67 @@ class BotPlayer:
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(team) >= FoodType.MEAT.buy_cost:
                     if controller.buy(bot_id, FoodType.MEAT, sx, sy):
-                        self.state = 3
+                        bs['state'] = 3
 
         # State 3: Place meat on counter for chopping
-        elif self.state == 3:
+        elif bs['state'] == 3:
             # Find a counter that's not where the plate is
-            chop_counter = self.find_empty_counter(controller, bx, by, exclude=self.assembly_counter)
+            chop_counter = self.find_empty_counter(controller, bx, by, exclude=bs['assembly_counter'])
             
             # If no separate counter available, we need to use the plate's counter
             if not chop_counter:
                 # Check if plate is on assembly counter - if so, we need to do chopping BEFORE placing plate
                 # For single counter scenario, do all chopping first, then buy plate
                 # Since plate isn't placed yet in this order, just use the assembly counter
-                chop_counter = self.assembly_counter  # Fallback to same counter
+                chop_counter = bs['assembly_counter']  # Fallback to same counter
             
             if not chop_counter:
                 chop_counter = self.find_empty_counter(controller, bx, by)  # Final fallback
             if not chop_counter:
                 return
-            self.chopping_counter = chop_counter
-            chx, chy = self.chopping_counter
+            bs['chopping_counter'] = chop_counter
+            chx, chy = bs['chopping_counter']
             if self.move_towards(controller, bot_id, chx, chy):
                 if controller.place(bot_id, chx, chy):
-                    self.state = 4
+                    bs['state'] = 4
 
         # State 4: Chop meat
-        elif self.state == 4:
-            if not self.chopping_counter:
-                self.state = 3  # Go back to find counter
+        elif bs['state'] == 4:
+            if not bs['chopping_counter']:
+                bs['state'] = 3  # Go back to find counter
                 return
-            chx, chy = self.chopping_counter
+            chx, chy = bs['chopping_counter']
             if self.move_towards(controller, bot_id, chx, chy):
                 if controller.chop(bot_id, chx, chy):
-                    self.state = 5
+                    bs['state'] = 5
 
         # State 5: Pick up chopped meat
-        elif self.state == 5:
-            if not self.chopping_counter:
-                self.state = 3
+        elif bs['state'] == 5:
+            if not bs['chopping_counter']:
+                bs['state'] = 3
                 return
-            chx, chy = self.chopping_counter
+            chx, chy = bs['chopping_counter']
             if self.move_towards(controller, bot_id, chx, chy):
                 if controller.pickup(bot_id, chx, chy):
-                    self.chopping_counter = None  # Clear after pickup
-                    self.state = 6
+                    bs['chopping_counter'] = None  # Clear after pickup
+                    bs['state'] = 6
 
         # State 6: Place meat in pan on cooker (starts cooking automatically)
-        elif self.state == 6:
+        elif bs['state'] == 6:
             if self.move_towards(controller, bot_id, kx, ky):
                 if controller.place(bot_id, kx, ky):
-                    # In single counter mode, mark that meat is in pan (to retrieve later)
-                    if self.single_counter_mode and not self.plate_ready:
-                        self.meat_in_pan = True
-                    self.current_ingredient_index += 1  # Meat is now cooking
-                    self.state = self._get_state_for_ingredient()  # Get next state (may go to state 8 for plate)
+                    # Track that meat is in pan and needs to be retrieved later
+                    bs['meat_in_pan'] = True
+                    bs['meat_placed_turn'] = controller.get_turn()
+                    bs['current_ingredient_index'] += 1  # Meat is now cooking
+                    bs['state'] = self._get_state_for_ingredient(bs)  # Get next state (may go to state 8 for plate)
 
         # State 7: (skipped - cooking starts automatically)
-        elif self.state == 7:
-            self.state = 8
+        elif bs['state'] == 7:
+            bs['state'] = 8
 
         # State 8: Buy plate
-        elif self.state == 8:
+        elif bs['state'] == 8:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
                 return
@@ -466,19 +587,19 @@ class BotPlayer:
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(team) >= ShopCosts.PLATE.buy_cost:
                     if controller.buy(bot_id, ShopCosts.PLATE, sx, sy):
-                        self.state = 9
+                        bs['state'] = 9
 
         # State 9: Place plate on counter, then dispatch to next ingredient
-        elif self.state == 9:
+        elif bs['state'] == 9:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.place(bot_id, cx, cy):
-                    self.plate_ready = True
+                    bs['plate_ready'] = True
                     # Don't reset index - continue from where we left off after chopping
                     # In single counter mode, chopping was done first
-                    self.state = self._get_state_for_ingredient()
+                    bs['state'] = self._get_state_for_ingredient(bs)
 
         # State 10: Buy noodles
-        elif self.state == 10:
+        elif bs['state'] == 10:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
                 return
@@ -486,51 +607,59 @@ class BotPlayer:
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(team) >= FoodType.NOODLES.buy_cost:
                     if controller.buy(bot_id, FoodType.NOODLES, sx, sy):
-                        self.state = 11
+                        bs['state'] = 11
 
         # State 11: Add noodles to plate, then go to next ingredient
-        elif self.state == 11:
+        elif bs['state'] == 11:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.add_food_to_plate(bot_id, cx, cy):
-                    self.current_ingredient_index += 1
-                    self.state = self._get_state_for_ingredient()
+                    bs['current_ingredient_index'] += 1
+                    bs['state'] = self._get_state_for_ingredient(bs)
 
         # State 12: Wait for meat to cook and take from pan
-        elif self.state == 12:
+        elif bs['state'] == 12:
+            # Wait at least 20 ticks for meat to cook
+            current_turn = controller.get_turn()
+            if bs['meat_placed_turn'] is not None:
+                ticks_waited = current_turn - bs['meat_placed_turn']
+                if ticks_waited < 20:
+                    # Still waiting for meat to cook - move towards cooker while waiting
+                    self.move_towards(controller, bot_id, kx, ky)
+                    return
+            
             if self.move_towards(controller, bot_id, kx, ky):
                 tile = controller.get_tile(controller.get_team(), kx, ky)
                 if tile and isinstance(getattr(tile, 'item', None), Pan) and tile.item.food:
                     food = tile.item.food
                     if food.cooked_stage == 1:  # Cooked
                         if controller.take_from_pan(bot_id, kx, ky):
-                            self.state = 13
+                            bs['state'] = 13
                     elif food.cooked_stage == 2:  # Burnt
                         if controller.take_from_pan(bot_id, kx, ky):
-                            self.state = 16  # Go to trash
+                            bs['state'] = 16  # Go to trash
+                    # else: still raw, keep waiting
                 else:
                     if bot_info.get('holding'):
-                        self.state = 16  # Something wrong, trash it
-                    else:
-                        self.state = 2  # Restart the cycle
+                        bs['state'] = 16  # Something wrong, trash it
+                    elif not bs['meat_in_pan']:
+                        bs['state'] = 2  # No meat in pan, restart the cycle
 
         # State 13: Add meat to plate, then go to next ingredient
-        elif self.state == 13:
+        elif bs['state'] == 13:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.add_food_to_plate(bot_id, cx, cy):
-                    self.meat_in_pan = False  # Meat has been added to plate
-                    # Don't increment index if this was from stored meat_in_pan
-                    if not self.single_counter_mode:
-                        self.current_ingredient_index += 1
-                    self.state = self._get_state_for_ingredient()
+                    bs['meat_in_pan'] = False  # Meat has been added to plate
+                    bs['meat_placed_turn'] = None  # Clear timing
+                    bs['state'] = self._get_state_for_ingredient(bs)
 
         # State 14: Pick up the completed plate
-        elif self.state == 14:
+        elif bs['state'] == 14:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.pickup(bot_id, cx, cy):
-                    self.state = 15
+                    bs['state'] = 15
 
         # State 15: Submit the order
-        elif self.state == 15:
+        elif bs['state'] == 15:
             submit_pos = self.find_nearest_tile(controller, bx, by, "SUBMIT")
             if not submit_pos:
                 return
@@ -538,28 +667,29 @@ class BotPlayer:
             if self.move_towards(controller, bot_id, ux, uy):
                 if controller.submit(bot_id, ux, uy):
                     # Reset order tracking
-                    self.current_order = None
-                    self.current_order_ingredients = []
-                    self.current_ingredient_index = 0
-                    self.plate_ready = False
-                    self.meat_in_pan = False
-                    self.chopped_items_ready = []
-                    self.state = 0  # Start a new cycle
+                    bs['current_order'] = None
+                    bs['current_order_ingredients'] = []
+                    bs['current_ingredient_index'] = 0
+                    bs['plate_ready'] = False
+                    bs['meat_in_pan'] = False
+                    bs['meat_placed_turn'] = None
+                    bs['chopped_items_ready'] = []
+                    bs['state'] = 0  # Start a new cycle
 
         # State 16: Trash (error recovery)
-        elif self.state == 16:
+        elif bs['state'] == 16:
             trash_pos = self.find_nearest_tile(controller, bx, by, "TRASH")
             if not trash_pos:
                 return
             tx, ty = trash_pos
             if self.move_towards(controller, bot_id, tx, ty):
                 if controller.trash(bot_id, tx, ty):
-                    self.state = 0  # Restart from beginning
+                    bs['state'] = 0  # Restart from beginning
 
         # ============== EGG RECIPE STATES (cook only, no chop) ==============
         
         # State 20: Buy egg
-        elif self.state == 20:
+        elif bs['state'] == 20:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
                 return
@@ -567,43 +697,43 @@ class BotPlayer:
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(team) >= FoodType.EGG.buy_cost:
                     if controller.buy(bot_id, FoodType.EGG, sx, sy):
-                        self.state = 21
+                        bs['state'] = 21
 
         # State 21: Place egg in pan on cooker (starts cooking)
-        elif self.state == 21:
+        elif bs['state'] == 21:
             if self.move_towards(controller, bot_id, kx, ky):
                 if controller.place(bot_id, kx, ky):
-                    self.state = 22
+                    bs['state'] = 22
 
         # State 22: Wait for egg to cook and take from pan
-        elif self.state == 22:
+        elif bs['state'] == 22:
             if self.move_towards(controller, bot_id, kx, ky):
                 tile = controller.get_tile(controller.get_team(), kx, ky)
                 if tile and isinstance(getattr(tile, 'item', None), Pan) and tile.item.food:
                     food = tile.item.food
                     if food.cooked_stage == 1:  # Cooked
                         if controller.take_from_pan(bot_id, kx, ky):
-                            self.state = 23
+                            bs['state'] = 23
                     elif food.cooked_stage == 2:  # Burnt
                         if controller.take_from_pan(bot_id, kx, ky):
-                            self.state = 16  # Go to trash
+                            bs['state'] = 16  # Go to trash
                 else:
                     if bot_info.get('holding'):
-                        self.state = 16
+                        bs['state'] = 16
                     else:
-                        self.state = 20  # Restart egg cycle
+                        bs['state'] = 20  # Restart egg cycle
 
         # State 23: Add egg to plate, then go to next ingredient
-        elif self.state == 23:
+        elif bs['state'] == 23:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.add_food_to_plate(bot_id, cx, cy):
-                    self.current_ingredient_index += 1
-                    self.state = self._get_state_for_ingredient()
+                    bs['current_ingredient_index'] += 1
+                    bs['state'] = self._get_state_for_ingredient(bs)
 
         # ============== ONION RECIPE STATES (chop only, no cook) ==============
         
         # State 30: Buy onions
-        elif self.state == 30:
+        elif bs['state'] == 30:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
                 return
@@ -611,60 +741,60 @@ class BotPlayer:
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(team) >= FoodType.ONIONS.buy_cost:
                     if controller.buy(bot_id, FoodType.ONIONS, sx, sy):
-                        self.state = 31
+                        bs['state'] = 31
 
         # State 31: Place onions on counter for chopping
-        elif self.state == 31:
+        elif bs['state'] == 31:
             # Find a counter that's not where the plate is
-            chop_counter = self.find_empty_counter(controller, bx, by, exclude=self.assembly_counter)
+            chop_counter = self.find_empty_counter(controller, bx, by, exclude=bs['assembly_counter'])
             
             # If no separate counter, use assembly counter (plate should not be there yet for single-counter)
             if not chop_counter:
-                chop_counter = self.assembly_counter
+                chop_counter = bs['assembly_counter']
             if not chop_counter:
                 chop_counter = self.find_empty_counter(controller, bx, by)  # Final fallback
             if not chop_counter:
                 return
-            self.chopping_counter = chop_counter
-            chx, chy = self.chopping_counter
+            bs['chopping_counter'] = chop_counter
+            chx, chy = bs['chopping_counter']
             if self.move_towards(controller, bot_id, chx, chy):
                 if controller.place(bot_id, chx, chy):
-                    self.state = 32
+                    bs['state'] = 32
 
         # State 32: Chop onions
-        elif self.state == 32:
-            if not self.chopping_counter:
-                self.state = 31
+        elif bs['state'] == 32:
+            if not bs['chopping_counter']:
+                bs['state'] = 31
                 return
-            chx, chy = self.chopping_counter
+            chx, chy = bs['chopping_counter']
             if self.move_towards(controller, bot_id, chx, chy):
                 if controller.chop(bot_id, chx, chy):
-                    self.state = 33
+                    bs['state'] = 33
 
         # State 33: Pickup chopped onions
-        elif self.state == 33:
-            if not self.chopping_counter:
-                self.state = 31
+        elif bs['state'] == 33:
+            if not bs['chopping_counter']:
+                bs['state'] = 31
                 return
-            chx, chy = self.chopping_counter
+            chx, chy = bs['chopping_counter']
             if self.move_towards(controller, bot_id, chx, chy):
                 if controller.pickup(bot_id, chx, chy):
-                    self.chopping_counter = None  # Clear after pickup
+                    bs['chopping_counter'] = None  # Clear after pickup
                     # In single counter mode without plate, store in box and go to next ingredient
-                    if self.single_counter_mode and not self.plate_ready:
-                        self.state = 35  # Store onions in box temporarily
+                    if bs['single_counter_mode'] and not bs['plate_ready']:
+                        bs['state'] = 35  # Store onions in box temporarily
                     else:
-                        self.state = 34  # Add to plate
+                        bs['state'] = 34  # Add to plate
 
         # State 34: Add onions to plate, then go to next ingredient
-        elif self.state == 34:
+        elif bs['state'] == 34:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.add_food_to_plate(bot_id, cx, cy):
-                    self.current_ingredient_index += 1
-                    self.state = self._get_state_for_ingredient()
+                    bs['current_ingredient_index'] += 1
+                    bs['state'] = self._get_state_for_ingredient(bs)
 
         # State 35: Store chopped onions in box (single counter mode)
-        elif self.state == 35:
+        elif bs['state'] == 35:
             box_pos = self.find_nearest_tile(controller, bx, by, "BOX")
             if not box_pos:
                 # No box, try to put in trash and restart (shouldn't happen in most maps)
@@ -672,14 +802,14 @@ class BotPlayer:
             bxx, bxy = box_pos
             if self.move_towards(controller, bot_id, bxx, bxy):
                 if controller.place(bot_id, bxx, bxy):
-                    self.chopped_items_ready.append(('ONIONS', box_pos))
-                    self.current_ingredient_index += 1
-                    self.state = self._get_state_for_ingredient()
+                    bs['chopped_items_ready'].append(('ONIONS', box_pos))
+                    bs['current_ingredient_index'] += 1
+                    bs['state'] = self._get_state_for_ingredient(bs)
 
         # ============== SAUCE RECIPE STATES (direct add, no processing) ==============
         
         # State 40: Buy sauce
-        elif self.state == 40:
+        elif bs['state'] == 40:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
                 return
@@ -687,57 +817,57 @@ class BotPlayer:
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(team) >= FoodType.SAUCE.buy_cost:
                     if controller.buy(bot_id, FoodType.SAUCE, sx, sy):
-                        self.state = 41
+                        bs['state'] = 41
 
         # State 41: Add sauce to plate, then go to next ingredient
-        elif self.state == 41:
+        elif bs['state'] == 41:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.add_food_to_plate(bot_id, cx, cy):
-                    self.current_ingredient_index += 1
-                    self.state = self._get_state_for_ingredient()
+                    bs['current_ingredient_index'] += 1
+                    bs['state'] = self._get_state_for_ingredient(bs)
 
         # ============== RETRIEVE PRE-CHOPPED ITEMS (single counter mode) ==============
         
         # State 50: Pickup pre-chopped item from box
-        elif self.state == 50:
-            if not self.chopped_items_ready:
-                self.state = self._get_state_for_ingredient()  # No more items, continue
+        elif bs['state'] == 50:
+            if not bs['chopped_items_ready']:
+                bs['state'] = self._get_state_for_ingredient(bs)  # No more items, continue
                 return
-            item_type, box_pos = self.chopped_items_ready[0]
+            item_type, box_pos = bs['chopped_items_ready'][0]
             bxx, bxy = box_pos
             if self.move_towards(controller, bot_id, bxx, bxy):
                 if controller.pickup(bot_id, bxx, bxy):
-                    self.chopped_items_ready.pop(0)  # Remove from list
-                    self.state = 51  # Go add to plate
+                    bs['chopped_items_ready'].pop(0)  # Remove from list
+                    bs['state'] = 51  # Go add to plate
 
         # State 51: Add retrieved item to plate
-        elif self.state == 51:
+        elif bs['state'] == 51:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.add_food_to_plate(bot_id, cx, cy):
-                    self.state = self._get_state_for_ingredient()  # Check for more items or continue
+                    bs['state'] = self._get_state_for_ingredient(bs)  # Check for more items or continue
 
-    def _get_state_for_ingredient(self) -> int:
+    def _get_state_for_ingredient(self, bs: Dict[str, Any]) -> int:
         """
         Returns the starting state for processing the current ingredient.
         If all ingredients are done, returns state 14 (pickup plate).
         For single counter mode, after chopping items go to buy plate state.
         """
         # If plate is ready, first check if we have pre-chopped items to retrieve
-        if self.plate_ready and self.chopped_items_ready:
+        if bs['plate_ready'] and bs['chopped_items_ready']:
             return 50  # Go retrieve pre-chopped items from box
         
-        # If plate is ready and meat is in pan, go retrieve it
-        if self.plate_ready and self.meat_in_pan:
-            return 12  # Go take meat from pan
+        # If meat is in pan, go retrieve it (applies to all modes)
+        if bs['plate_ready'] and bs['meat_in_pan']:
+            return 12  # Go take meat from pan (will wait for cooking)
         
-        if self.current_ingredient_index >= len(self.current_order_ingredients):
+        if bs['current_ingredient_index'] >= len(bs['current_order_ingredients']):
             return 14  # All ingredients done, pickup plate
         
-        ingredient = self.current_order_ingredients[self.current_ingredient_index]
+        ingredient = bs['current_order_ingredients'][bs['current_ingredient_index']]
         
         # For single counter mode: if plate isn't ready and we hit a non-choppable item,
         # go buy plate first
-        if self.single_counter_mode and not self.plate_ready:
+        if bs['single_counter_mode'] and not bs['plate_ready']:
             if ingredient not in ['MEAT', 'ONIONS']:  # Non-choppable items
                 return 8  # Go buy plate first
         
@@ -751,37 +881,3 @@ class BotPlayer:
         }
         
         return ingredient_states.get(ingredient, 14)  # Default to pickup if unknown
-
-    def _handle_secondary_bot(self, controller: RobotController, bot_id: int):
-        """
-        Handle secondary bots - they can assist with simpler tasks or move randomly.
-        """
-        bot_info = controller.get_bot_state(bot_id)
-        if bot_info is None:
-            return
-            
-        bx, by = bot_info['x'], bot_info['y']
-        holding = bot_info.get('holding')
-        
-        # If holding something, try to trash it
-        if holding:
-            trash_pos = self.find_nearest_tile(controller, bx, by, "TRASH")
-            if trash_pos:
-                tx, ty = trash_pos
-                if self.move_towards(controller, bot_id, tx, ty):
-                    controller.trash(bot_id, tx, ty)
-                return
-        
-        # Otherwise, move randomly to stay out of the way
-        possible_moves = []
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == 0 and dy == 0:
-                    continue
-                nx, ny = bx + dx, by + dy
-                if controller.get_map(controller.get_team()).is_tile_walkable(nx, ny):
-                    possible_moves.append((dx, dy))
-        
-        if possible_moves:
-            dx, dy = random.choice(possible_moves)
-            controller.move(bot_id, dx, dy)
