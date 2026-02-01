@@ -68,47 +68,81 @@ class BotPlayer:
         self.chopped_items_ready = []  # Items that have been chopped and are waiting in box
         self.meat_in_pan = False  # True when meat has been placed in pan (for single counter mode)
         
+        # Pre-cache tile locations for O(1) lookup instead of O(n²) grid scans
+        self._tile_cache = {}  # tile_name -> list of (x, y) positions
+        self._num_counters = 0
+        self._cache_initialized = False
+        
+    def _init_tile_cache(self):
+        """Initialize tile location cache for O(1) lookups."""
+        if self._cache_initialized:
+            return
+        self._tile_cache = {}
+        self._num_counters = 0
+        for x in range(self.map.width):
+            for y in range(self.map.height):
+                tile = self.map.tiles[x][y]
+                tile_name = tile.tile_name
+                if tile_name not in self._tile_cache:
+                    self._tile_cache[tile_name] = []
+                self._tile_cache[tile_name].append((x, y))
+                if tile_name == "COUNTER":
+                    self._num_counters += 1
+        self._cache_initialized = True
+
     def get_bfs_path(self, controller: RobotController, start: Tuple[int, int], target_predicate) -> Optional[Tuple[int, int]]:
         """
         Use Dijkstra's algorithm to find the shortest path.
         Returns the first step (dx, dy) to take, or None if no path exists.
         Diagonal moves cost sqrt(2), orthogonal moves cost 1.
+        Optimized: uses parent pointers instead of storing full paths.
         """
         SQRT2 = 1.41421356
         
-        # Priority queue: (cost, x, y, path)
-        heap = [(0, start[0], start[1], [])]
-        visited = {}  # Maps (x, y) -> best cost to reach it
+        # Priority queue: (cost, counter, x, y) - counter breaks ties for stable ordering
+        counter = 0
+        heap = [(0, counter, start[0], start[1])]
+        # Maps (x, y) -> (best_cost, parent_x, parent_y, dx_from_parent, dy_from_parent)
+        visited = {start: (0, None, None, 0, 0)}
         w, h = self.map.width, self.map.height
+        team = controller.get_team()
+        game_map = controller.get_map(team)
 
         while heap:
-            cost, curr_x, curr_y, path = heapq.heappop(heap)
+            cost, _, curr_x, curr_y = heapq.heappop(heap)
             
             # Skip if we've already found a better path to this node
-            if (curr_x, curr_y) in visited and visited[(curr_x, curr_y)] < cost:
+            if visited[(curr_x, curr_y)][0] < cost:
                 continue
             
-            tile = controller.get_tile(controller.get_team(), curr_x, curr_y)
+            tile = controller.get_tile(team, curr_x, curr_y)
             if target_predicate(curr_x, curr_y, tile):
-                if not path:
-                    return (0, 0) 
-                return path[0] 
+                # Reconstruct first step by walking back to start
+                if (curr_x, curr_y) == start:
+                    return (0, 0)
+                # Walk back to find the first step
+                px, py = curr_x, curr_y
+                while True:
+                    _, parent_x, parent_y, dx, dy = visited[(px, py)]
+                    if parent_x is None or (parent_x, parent_y) == start:
+                        return (dx, dy)
+                    px, py = parent_x, parent_y
 
-            for dx in [0, -1, 1]:
-                for dy in [0, -1, 1]:
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
                     if dx == 0 and dy == 0:
                         continue
                     nx, ny = curr_x + dx, curr_y + dy
-                    if 0 <= nx < w and 0 <= ny < h:
-                        if controller.get_map(controller.get_team()).is_tile_walkable(nx, ny):
-                            # Calculate move cost: diagonal = sqrt(2), orthogonal = 1
-                            move_cost = SQRT2 if (dx != 0 and dy != 0) else 1
-                            new_cost = cost + move_cost
-                            
-                            # Only explore if we haven't found a better path
-                            if (nx, ny) not in visited or visited[(nx, ny)] > new_cost:
-                                visited[(nx, ny)] = new_cost
-                                heapq.heappush(heap, (new_cost, nx, ny, path + [(dx, dy)]))
+                    if 0 <= nx < w and 0 <= ny < h and game_map.is_tile_walkable(nx, ny):
+                        # Calculate move cost: diagonal = sqrt(2), orthogonal = 1
+                        move_cost = SQRT2 if (dx != 0 and dy != 0) else 1.0
+                        new_cost = cost + move_cost
+                        
+                        # Only explore if we haven't found a better path
+                        if (nx, ny) not in visited or visited[(nx, ny)][0] > new_cost:
+                            visited[(nx, ny)] = (new_cost, curr_x, curr_y, dx, dy)
+                            counter += 1
+                            heapq.heappush(heap, (new_cost, counter, nx, ny))
         return None
 
     def get_shortest_path_length(self, controller: RobotController, start: Tuple[int, int], target_predicate) -> Optional[int]:
@@ -162,64 +196,72 @@ class BotPlayer:
     def find_nearest_tile(self, controller: RobotController, bot_x: int, bot_y: int, tile_name: str) -> Optional[Tuple[int, int]]:
         """
         Find the nearest tile of a given type using Chebyshev distance.
+        Optimized: uses cached tile locations for O(k) instead of O(n²).
         """
+        self._init_tile_cache()
+        
+        if tile_name not in self._tile_cache:
+            return None
+        
         best_dist = 9999
         best_pos = None
-        m = controller.get_map(controller.get_team())
         
-        for x in range(m.width):
-            for y in range(m.height):
-                tile = m.tiles[x][y]
-                if tile.tile_name == tile_name:
-                    dist = max(abs(bot_x - x), abs(bot_y - y))
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_pos = (x, y)
+        for x, y in self._tile_cache[tile_name]:
+            dist = max(abs(bot_x - x), abs(bot_y - y))
+            if dist < best_dist:
+                best_dist = dist
+                best_pos = (x, y)
         return best_pos
 
     def find_empty_counter(self, controller: RobotController, bot_x: int, bot_y: int, exclude: Optional[Tuple[int, int]] = None) -> Optional[Tuple[int, int]]:
         """
         Find the nearest empty counter tile, optionally excluding a specific position.
+        Optimized: uses cached counter locations.
         """
+        self._init_tile_cache()
+        
+        if "COUNTER" not in self._tile_cache:
+            return None
+        
         best_dist = 9999
         best_pos = None
-        m = controller.get_map(controller.get_team())
+        team = controller.get_team()
         
-        for x in range(m.width):
-            for y in range(m.height):
-                tile = m.tiles[x][y]
-                if tile.tile_name == "COUNTER":
-                    # Skip excluded position
-                    if exclude and (x, y) == exclude:
-                        continue
-                    actual_tile = controller.get_tile(controller.get_team(), x, y)
-                    if actual_tile and getattr(actual_tile, 'item', None) is None:
-                        dist = max(abs(bot_x - x), abs(bot_y - y))
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_pos = (x, y)
+        for x, y in self._tile_cache["COUNTER"]:
+            # Skip excluded position
+            if exclude and (x, y) == exclude:
+                continue
+            actual_tile = controller.get_tile(team, x, y)
+            if actual_tile and getattr(actual_tile, 'item', None) is None:
+                dist = max(abs(bot_x - x), abs(bot_y - y))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pos = (x, y)
         return best_pos
 
     def find_empty_cooker(self, controller: RobotController, bot_x: int, bot_y: int) -> Optional[Tuple[int, int]]:
         """
         Find the nearest cooker with an empty pan or no pan.
+        Optimized: uses cached cooker locations.
         """
+        self._init_tile_cache()
+        
+        if "COOKER" not in self._tile_cache:
+            return None
+        
         best_dist = 9999
         best_pos = None
-        m = controller.get_map(controller.get_team())
+        team = controller.get_team()
         
-        for x in range(m.width):
-            for y in range(m.height):
-                tile = m.tiles[x][y]
-                if tile.tile_name == "COOKER":
-                    actual_tile = controller.get_tile(controller.get_team(), x, y)
-                    if actual_tile:
-                        pan = getattr(actual_tile, 'item', None)
-                        if pan is None or (isinstance(pan, Pan) and pan.food is None):
-                            dist = max(abs(bot_x - x), abs(bot_y - y))
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_pos = (x, y)
+        for x, y in self._tile_cache["COOKER"]:
+            actual_tile = controller.get_tile(team, x, y)
+            if actual_tile:
+                pan = getattr(actual_tile, 'item', None)
+                if pan is None or (isinstance(pan, Pan) and pan.food is None):
+                    dist = max(abs(bot_x - x), abs(bot_y - y))
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_pos = (x, y)
         return best_pos
 
     def play_turn(self, controller: RobotController):
@@ -286,8 +328,8 @@ class BotPlayer:
             
             # Check if we have only one counter - if so, reorder to do choppable items first
             # This way we chop before placing the plate
-            num_counters = sum(1 for x in range(self.map.width) for y in range(self.map.height) 
-                              if self.map.tiles[x][y].tile_name == "COUNTER")
+            self._init_tile_cache()  # Ensure cache is initialized
+            num_counters = self._num_counters
             
             if num_counters <= 1:
                 # Reorder: choppable items (MEAT, ONIONS) first, then cookable (EGG), then direct (NOODLES, SAUCE)
