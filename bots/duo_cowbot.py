@@ -85,6 +85,11 @@ class BotPlayer:
             'chopped_items_ready': [],
             'meat_in_pan': False,
             'meat_placed_turn': None,
+            'last_move': None,  # (dx, dy) of last movement for momentum
+            'stuck_counter': 0,  # Count turns stuck in same position
+            'last_position': None,  # Last position for stuck detection
+            'position_history': [],  # Track recent positions for oscillation detection
+            'oscillation_counter': 0,  # Track how long we've been oscillating
         }
         
     def _init_tile_cache(self):
@@ -94,6 +99,7 @@ class BotPlayer:
         self._tile_cache = {}
         self._num_counters = 0
         self._num_cookers = 0
+        self._num_walkable = 0
         for x in range(self.map.width):
             for y in range(self.map.height):
                 tile = self.map.tiles[x][y]
@@ -105,10 +111,13 @@ class BotPlayer:
                     self._num_counters += 1
                 if tile_name == "COOKER":
                     self._num_cookers += 1
+                if tile.is_walkable:
+                    self._num_walkable += 1
         
         # Check if we have enough resources for dual bot mode
         # Need at least 2 counters and 2 cookers for 2 bots to work simultaneously
-        self.dual_bot_mode = (self._num_counters >= 2 and self._num_cookers >= 2)
+        # Also need enough walkable space - narrow maps like orbit cause collisions
+        self.dual_bot_mode = (self._num_counters >= 2 and self._num_cookers >= 2 and self._num_walkable >= 80)
         self._cache_initialized = True
 
     def get_bfs_path(self, controller: RobotController, start: Tuple[int, int], target_predicate, blocked_positions: set = None) -> Optional[Tuple[int, int]]:
@@ -211,12 +220,14 @@ class BotPlayer:
         """
         Move the bot towards the target position, avoiding other bots.
         Returns True if already adjacent to target, False otherwise.
+        Uses momentum to prefer continuing in the same direction to avoid oscillation.
         """
         bot_state = controller.get_bot_state(bot_id)
         if bot_state is None:
             return False
             
         bx, by = bot_state['x'], bot_state['y']
+        bs = self.bot_states.get(bot_id, {})
         
         def is_adjacent_to_target(x, y, tile):
             return max(abs(x - target_x), abs(y - target_y)) <= 1
@@ -224,30 +235,65 @@ class BotPlayer:
         if is_adjacent_to_target(bx, by, None):
             return True
         
+        # Track if we're stuck (same position for multiple turns)
+        if bs.get('last_position') == (bx, by):
+            bs['stuck_counter'] = bs.get('stuck_counter', 0) + 1
+        else:
+            bs['stuck_counter'] = 0
+        bs['last_position'] = (bx, by)
+        
         # Get positions of other bots to avoid
         other_bot_positions = self._get_other_bot_positions(controller, bot_id)
+        game_map = controller.get_map(controller.get_team())
         
+        # First try to find path avoiding other bots
         step = self.get_bfs_path(controller, (bx, by), is_adjacent_to_target, other_bot_positions)
+        
+        # If no path found or if the step would move us AWAY from target (indicating blockage),
+        # try pathfinding ignoring other bots - they might move
+        if step:
+            # Check if this step moves us further from target (sign of blocked path)
+            new_x, new_y = bx + step[0], by + step[1]
+            curr_dist = max(abs(bx - target_x), abs(by - target_y))
+            new_dist = max(abs(new_x - target_x), abs(new_y - target_y))
+            
+            if new_dist > curr_dist and bs.get('stuck_counter', 0) > 0:
+                # Path is blocked, try ignoring other bots
+                ideal_step = self.get_bfs_path(controller, (bx, by), is_adjacent_to_target, set())
+                if ideal_step:
+                    ideal_x, ideal_y = bx + ideal_step[0], by + ideal_step[1]
+                    if (ideal_x, ideal_y) not in other_bot_positions:
+                        # The ideal path is not blocked, use it
+                        step = ideal_step
+                    else:
+                        # Ideal path IS blocked by another bot, wait for them
+                        return False
+        
         if step and (step[0] != 0 or step[1] != 0):
-            # Double check we're not moving into another bot
+            # Check momentum: if we have a last move and we're not stuck, prefer to continue that direction
+            last_move = bs.get('last_move')
+            
+            # Check if continuing last move is still valid and makes progress
+            if last_move:
+                nx, ny = bx + last_move[0], by + last_move[1]
+                if game_map.is_tile_walkable(nx, ny) and (nx, ny) not in other_bot_positions:
+                    # Check if it gets us closer or at least not further
+                    curr_dist = max(abs(bx - target_x), abs(by - target_y))
+                    new_dist = max(abs(nx - target_x), abs(ny - target_y))
+                    if new_dist <= curr_dist:
+                        controller.move(bot_id, last_move[0], last_move[1])
+                        return False
+            
+            # Use pathfinder's suggestion
             new_x, new_y = bx + step[0], by + step[1]
             if (new_x, new_y) not in other_bot_positions:
                 controller.move(bot_id, step[0], step[1])
+                bs['last_move'] = step
                 return False
             else:
-                # Try to find an alternative move or wait
-                game_map = controller.get_map(controller.get_team())
-                for dx in [-1, 0, 1]:
-                    for dy in [-1, 0, 1]:
-                        if dx == 0 and dy == 0:
-                            continue
-                        nx, ny = bx + dx, by + dy
-                        if game_map.is_tile_walkable(nx, ny) and (nx, ny) not in other_bot_positions:
-                            controller.move(bot_id, dx, dy)
-                            return False
-                # No valid move, just wait
+                # Blocked by another bot - just wait
                 return False
-        return False 
+        return False
 
     def find_nearest_tile(self, controller: RobotController, bot_x: int, bot_y: int, tile_name: str) -> Optional[Tuple[int, int]]:
         """
@@ -339,7 +385,6 @@ class BotPlayer:
         # Determine how many bots can work simultaneously
         num_active_bots = 2 if (self.dual_bot_mode and len(my_bots) >= 2) else 1
         
-
         # Allocate resources to bots if not done yet
         if num_active_bots >= 2 and not self.bot_resources:
             self._allocate_resources(controller, my_bots[:2])
@@ -424,7 +469,30 @@ class BotPlayer:
         cx, cy = bs['assembly_counter']
         kx, ky = bs['cooker_loc']
         
-        # print(f"Bot {bot_id} running state {bs['state']} at ({bx},{by}), counter=({cx},{cy}), cooker=({kx},{ky})")
+        # Track position history for oscillation detection
+        position_history = bs.get('position_history', [])
+        position_history.append((bx, by))
+        if len(position_history) > 20:
+            position_history = position_history[-20:]
+        bs['position_history'] = position_history
+        
+        # Detect oscillation: if we've visited the same small set of positions repeatedly
+        if len(position_history) >= 10:
+            recent_positions = set(position_history[-10:])
+            if len(recent_positions) <= 4:  # Only 4 or fewer unique positions in last 10 moves
+                bs['oscillation_counter'] = bs.get('oscillation_counter', 0) + 1
+            else:
+                bs['oscillation_counter'] = 0
+        
+        # If oscillating for too long and holding something, trash and restart
+        if bs.get('oscillation_counter', 0) > 15 and bot_info.get('holding'):
+            # print(f"Bot {bot_id} detected oscillation, trashing and restarting")
+            bs['oscillation_counter'] = 0
+            bs['position_history'] = []
+            bs['state'] = 16  # Go to trash
+            return
+        
+        print(f"Bot {bot_id} state {bs['state']} at ({bx},{by}), turn={controller.get_turn()}, holding={bool(bot_info.get('holding'))}")
         
         # Error recovery: if we're holding something in certain states, trash it
         if bs['state'] in [2, 8, 10] and bot_info.get('holding'):
@@ -506,17 +574,17 @@ class BotPlayer:
                 estimated_time = 0
                 for ing in ingredients:
                     if ing == 'MEAT':
-                        estimated_time += 40  # chop + cook + wait
+                        estimated_time += 8   # chop + cook (reduced from 12)
                     elif ing == 'EGG':
-                        estimated_time += 25  # cook + wait
+                        estimated_time += 5   # cook (reduced from 8)
                     elif ing == 'ONIONS':
-                        estimated_time += 20  # chop
+                        estimated_time += 4   # chop (reduced from 6)
                     elif ing == 'NOODLES':
-                        estimated_time += 10  # just buy and add
+                        estimated_time += 2   # just buy and add (reduced from 3)
                     elif ing == 'SAUCE':
-                        estimated_time += 8   # just buy and add
-                # Add base time for plate + submit + movement
-                estimated_time += 20
+                        estimated_time += 2   # just buy and add
+                # Add base time for plate + submit + movement (reduced from 6)
+                estimated_time += 4
                 return estimated_time
             
             def is_feasible(order):
@@ -542,6 +610,7 @@ class BotPlayer:
                 """
                 Score an order based on reward, complexity, and time efficiency.
                 Higher score = better order to pick.
+                Optimized to strongly prefer simple, high-efficiency orders.
                 """
                 reward = order.get('reward', 0)
                 expires = order.get('expires_turn', 9999)
@@ -551,20 +620,28 @@ class BotPlayer:
                 estimated_time = estimate_completion_time(ingredients)
                 time_margin = time_left - estimated_time
                 
-                # Urgency bonus: orders expiring soon get slight priority if feasible
-                urgency_bonus = max(0, 50 - time_margin) * 0.05 if time_margin > 0 else 0
-                
-                # Efficiency: reward per estimated time unit
+                # Primary metric: reward per time unit (efficiency)
                 efficiency = reward / max(estimated_time, 1)
                 
-                # Complexity penalty: more ingredients = harder to complete
-                complexity_factor = 1.0 / (1 + len(ingredients) * 0.15)
+                # Strong complexity penalty: each ingredient adds significant time/risk
+                # 1 ingredient = 1.0, 2 = 0.7, 3 = 0.5, 4 = 0.4, 5 = 0.33
+                num_ingredients = len(ingredients)
+                complexity_factor = 1.0 / (1 + num_ingredients * 0.45)
                 
-                # Time margin bonus: comfortable margin = more reliable
-                margin_factor = min(1.5, 1.0 + time_margin / 100)
+                # Bonus for no-cook orders (NOODLES, SAUCE, ONIONS only - faster to complete)
+                needs_cooking = any(ing in ['MEAT', 'EGG'] for ing in ingredients)
+                cook_factor = 0.8 if needs_cooking else 1.2
                 
-                # Final score: efficiency * complexity * margin + urgency + raw reward bonus
-                score = (efficiency * 15) * complexity_factor * margin_factor + urgency_bonus + reward * 0.05
+                # Time margin - prefer orders with comfortable margin
+                if time_margin < 0:
+                    margin_factor = 0.1  # Very low score for likely-to-fail orders
+                elif time_margin < estimated_time * 0.5:
+                    margin_factor = 0.7  # Tight margin
+                else:
+                    margin_factor = 1.0  # Comfortable
+                
+                # Final score: heavily weighted toward efficiency
+                score = efficiency * complexity_factor * cook_factor * margin_factor * 100
                 
                 return score
             
@@ -698,16 +775,19 @@ class BotPlayer:
             # Find a counter that's not where the plate is
             chop_counter = self.find_empty_counter(controller, bx, by, exclude=bs['assembly_counter'])
             
-            # If no separate counter available, we need to use the plate's counter
+            # If no separate counter available, check if assembly counter is empty
             if not chop_counter:
-                # Check if plate is on assembly counter - if so, we need to do chopping BEFORE placing plate
-                # For single counter scenario, do all chopping first, then buy plate
-                # Since plate isn't placed yet in this order, just use the assembly counter
-                chop_counter = bs['assembly_counter']  # Fallback to same counter
+                # Check if assembly counter is actually empty
+                tile = controller.get_tile(team, cx, cy)
+                if tile and getattr(tile, 'item', None) is None:
+                    chop_counter = bs['assembly_counter']  # Use it if empty
+                else:
+                    # Try to find ANY empty counter
+                    chop_counter = self.find_empty_counter(controller, bx, by)
             
             if not chop_counter:
-                chop_counter = self.find_empty_counter(controller, bx, by)  # Final fallback
-            if not chop_counter:
+                # No empty counter available - trash and restart
+                bs['state'] = 16
                 return
             bs['chopping_counter'] = chop_counter
             chx, chy = bs['chopping_counter']
@@ -754,15 +834,36 @@ class BotPlayer:
         elif bs['state'] == 8:
             shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
             if not shop_pos:
+                print(f"Bot {bot_id} state 8: NO SHOP FOUND!")
                 return
             sx, sy = shop_pos
+            print(f"Bot {bot_id} state 8: shop at ({sx},{sy}), money={controller.get_team_money(team)}")
             if self.move_towards(controller, bot_id, sx, sy):
+                print(f"Bot {bot_id} state 8: adjacent to shop, trying to buy")
                 if controller.get_team_money(team) >= ShopCosts.PLATE.buy_cost:
                     if controller.buy(bot_id, ShopCosts.PLATE, sx, sy):
                         bs['state'] = 9
+                        print(f"Bot {bot_id} state 8: bought plate, -> state 9")
+                    else:
+                        print(f"Bot {bot_id} state 8: buy FAILED!")
+                else:
+                    print(f"Bot {bot_id} state 8: not enough money for plate")
 
         # State 9: Place plate on counter, then dispatch to next ingredient
         elif bs['state'] == 9:
+            # Check if assembly counter is empty, if not find a new one
+            tile = controller.get_tile(team, cx, cy)
+            if tile and getattr(tile, 'item', None) is not None:
+                # Counter is occupied, find a new empty counter
+                new_counter = self.find_empty_counter(controller, bx, by)
+                if new_counter:
+                    bs['assembly_counter'] = new_counter
+                    cx, cy = new_counter
+                else:
+                    # No empty counter - trash what we're holding and restart
+                    bs['state'] = 16
+                    return
+            
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.place(bot_id, cx, cy):
                     bs['plate_ready'] = True
@@ -832,6 +933,16 @@ class BotPlayer:
 
         # State 15: Submit the order
         elif bs['state'] == 15:
+            # Check if the order is still active - if not, trash the plate and restart
+            if bs['current_order']:
+                order_id = bs['current_order'].get('order_id')
+                orders = controller.get_orders(team)
+                current_order = next((o for o in orders if o.get('order_id') == order_id), None)
+                if current_order is None or not current_order.get('is_active') or current_order.get('completed_turn') is not None:
+                    # Order expired or completed, trash the plate
+                    bs['state'] = 16
+                    return
+            
             submit_pos = self.find_nearest_tile(controller, bx, by, "SUBMIT")
             if not submit_pos:
                 return
@@ -847,15 +958,37 @@ class BotPlayer:
                     bs['meat_placed_turn'] = None
                     bs['chopped_items_ready'] = []
                     bs['state'] = 0  # Start a new cycle
+                else:
+                    # Submit failed - order might have expired, trash and restart
+                    bs['state'] = 16
 
         # State 16: Trash (error recovery)
         elif bs['state'] == 16:
+            # If not holding anything, skip trash and go straight to state 0
+            if not bot_info.get('holding'):
+                bs['current_order'] = None
+                bs['current_order_ingredients'] = []
+                bs['current_ingredient_index'] = 0
+                bs['plate_ready'] = False
+                bs['meat_in_pan'] = False
+                bs['meat_placed_turn'] = None
+                bs['chopped_items_ready'] = []
+                bs['state'] = 0
+                return
+            
             trash_pos = self.find_nearest_tile(controller, bx, by, "TRASH")
             if not trash_pos:
                 return
             tx, ty = trash_pos
             if self.move_towards(controller, bot_id, tx, ty):
                 if controller.trash(bot_id, tx, ty):
+                    bs['current_order'] = None
+                    bs['current_order_ingredients'] = []
+                    bs['current_ingredient_index'] = 0
+                    bs['plate_ready'] = False
+                    bs['meat_in_pan'] = False
+                    bs['meat_placed_turn'] = None
+                    bs['chopped_items_ready'] = []
                     bs['state'] = 0  # Restart from beginning
 
         # ============== EGG RECIPE STATES (cook only, no chop) ==============
